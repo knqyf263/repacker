@@ -12,10 +12,6 @@
   name = "golang.org/x/tools"
   packages = [
     "go/ast/astutil",
-    "go/gcexportdata",
-    "go/internal/gcimporter",
-    "go/packages",
-    "go/types/typeutil",
     "imports",
     "internal/fastwalk"
   ]
@@ -24,6 +20,6 @@
 [solve-meta]
   analyzer-name = "dep"
   analyzer-version = 1
-  inputs-digest = "a208bdc9567438cad1ed841a506bccac774606b48b2c3e4bd14bca92eab30463"
+  inputs-digest = "945916a4eb3a707c5848c45d80198a9434d1644d9cb93dc90b9d113e5cb62e0e"
   solver-name = "gps-cdcl"
   solver-version = 1
