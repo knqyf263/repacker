@@ -75,6 +75,7 @@ func run(argDir string) (err error) {
 	if err != nil {
 		return errors.Wrapf(err, "Abs %s: %s", g.dir, err)
 	}
+	g.rootDir = d
 	dstType := Type{
 		dir:  d,
 		name: *dst,
@@ -89,14 +90,18 @@ func run(argDir string) (err error) {
 		return errors.Wrapf(err, "generate: %s", err)
 	}
 
+	var formatOnly bool
+	if g.rootDir == srcType.dir {
+		formatOnly = true
+	}
 	// Format the output.
-	srcCode, err := g.goimport()
+	srcCode, err := g.goimport(formatOnly)
 	if err != nil {
 		return errors.Wrapf(err, "goimport: %s", err)
 	}
 
 	// Write to file.
-	baseName := fmt.Sprintf("%s_repack.go", dstType.name)
+	baseName := fmt.Sprintf("%s_from_%s_repack.go", dstType.name, srcType.name)
 	outputName := filepath.Join(dstType.dir, strings.ToLower(baseName))
 	err = ioutil.WriteFile(outputName, srcCode, 0644)
 	if err != nil {
@@ -112,6 +117,7 @@ type Generator struct {
 	dir       string
 	funcNames map[string]bool
 	fset      *token.FileSet
+	rootDir   string
 }
 
 func (g *Generator) parseFullTypeString(fullType string, pkg *Package) Type {
@@ -223,7 +229,9 @@ func (g *Generator) generateHead(pkgName, importPath string) {
 	g.Printf("\n")
 	g.Printf("package %s", pkgName)
 	g.Printf("\n")
-	g.Printf("import \"%s\"\n", imports.VendorlessPath(importPath))
+	if g.rootDir != importPath {
+		g.Printf("import \"%s\"\n", imports.VendorlessPath(importPath))
+	}
 }
 
 type Type struct {
@@ -313,15 +321,21 @@ func (o Object) SliceName() (name string) {
 	return o.Name()
 }
 
-func (o Object) FullName() string {
+func (o Object) FullName(rootDir string) string {
+	if rootDir == o.pkg.dir {
+		return fmt.Sprintf("*%s", o.object.Name())
+	}
 	return fmt.Sprintf("*%s.%s", o.pkg.name, o.object.Name())
 }
 
-func (o Object) SliceFullName() (name string) {
+func (o Object) SliceFullName(rootDir string) (name string) {
 	if o.typ.isSlice && !o.typ.isPointer {
+		if rootDir == o.pkg.dir {
+			return o.object.Name()
+		}
 		return fmt.Sprintf("%s.%s", o.pkg.name, o.object.Name())
 	}
-	return o.FullName()
+	return o.FullName(rootDir)
 }
 
 func (o Object) PtrName() string {
@@ -336,15 +350,19 @@ func (g *Generator) generateCode(src, dst Object) (funcName string) {
 	var body bytes.Buffer
 	var variables bytes.Buffer
 
+	var pkgName string
+	if g.rootDir != src.pkg.dir {
+		pkgName = strings.Title(src.pkg.name)
+	}
 	funcName = fmt.Sprintf("New%sFrom%s%s",
-		dst.object.Name(), strings.Title(src.pkg.name), src.object.Name())
+		dst.object.Name(), pkgName, src.object.Name())
 	if g.funcNames[funcName] {
 		return funcName
 	}
 	g.funcNames[funcName] = true
 
-	fmt.Fprintf(&code, "// %s creates %s from %s\n", funcName, dst.Name(), src.FullName())
-	fmt.Fprintf(&code, "func %s (s %s) %s {\n", funcName, src.FullName(), dst.Name())
+	fmt.Fprintf(&code, "// %s creates %s from %s\n", funcName, dst.Name(), src.FullName(g.rootDir))
+	fmt.Fprintf(&code, "func %s (s %s) %s {\n", funcName, src.FullName(g.rootDir), dst.Name())
 	fmt.Fprintf(&body, "	return %s{\n", dst.PtrName())
 	for i := 0; i < srcInternal.NumFields(); i++ {
 		for j := 0; j < dstInternal.NumFields(); j++ {
@@ -439,8 +457,8 @@ func (g *Generator) generateSliceCode(src, dst Object) (funcName string) {
 	g.funcNames[funcName] = true
 
 	var code bytes.Buffer
-	fmt.Fprintf(&code, "// %s creates []%s from []%s\n", funcName, dst.SliceName(), src.SliceFullName())
-	fmt.Fprintf(&code, "func %s (s []%s) (d []%s) {\n", funcName, src.SliceFullName(), dst.SliceName())
+	fmt.Fprintf(&code, "// %s creates []%s from []%s\n", funcName, dst.SliceName(), src.SliceFullName(g.rootDir))
+	fmt.Fprintf(&code, "func %s (s []%s) (d []%s) {\n", funcName, src.SliceFullName(g.rootDir), dst.SliceName())
 	fmt.Fprintf(&code, "	for _, t := range s{\n")
 	fmt.Fprintf(&code, "		d = append(d, %s)\n", nestedFunc)
 	fmt.Fprintf(&code, "	}\n")
@@ -477,8 +495,16 @@ func (g *Generator) generateConverteCode(typ Type, primitive string) (string, er
 
 }
 
-func (g *Generator) goimport() ([]byte, error) {
-	src, err := imports.Process("", g.buf.Bytes(), nil)
+func (g *Generator) goimport(formatOnly bool) ([]byte, error) {
+	opts := &imports.Options{
+		Comments:  true,
+		TabIndent: true,
+		TabWidth:  8,
+	}
+	if formatOnly {
+		opts.FormatOnly = true
+	}
+	src, err := imports.Process("", g.buf.Bytes(), opts)
 	if err != nil {
 		return nil, errors.Wrap(err, "Failed to formats and adjusts imports for the provided file")
 	}

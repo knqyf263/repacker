@@ -2,24 +2,31 @@
 
 
 [[projects]]
+  digest = "1:40e195917a951a8bf867cd05de2a46aaf1806c50cf92eebf4c16f78cd196f747"
   name = "github.com/pkg/errors"
   packages = ["."]
+  pruneopts = "UT"
   revision = "645ef00459ed84a119197bfb8d8205042c6df63d"
   version = "v0.8.0"
 
 [[projects]]
   branch = "master"
+  digest = "1:e1c96c8c8ce0af57da9dccb008e540b3d13b55ea04b530fb4fceb81706082bdd"
   name = "golang.org/x/tools"
   packages = [
     "go/ast/astutil",
     "imports",
-    "internal/fastwalk"
+    "internal/fastwalk",
   ]
+  pruneopts = "UT"
   revision = "99195f4d4ffa6331a9bc856c72697a15d9842950"
 
 [solve-meta]
   analyzer-name = "dep"
   analyzer-version = 1
-  inputs-digest = "945916a4eb3a707c5848c45d80198a9434d1644d9cb93dc90b9d113e5cb62e0e"
+  input-imports = [
+    "github.com/pkg/errors",
+    "golang.org/x/tools/imports",
+  ]
   solver-name = "gps-cdcl"
   solver-version = 1
