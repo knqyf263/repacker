@@ -61,7 +61,7 @@ func main() {
 	}
 
 	if err := run(args[0]); err != nil {
-		log.Fatalf("%+v", err)
+		log.Fatal(err)
 	}
 }
 
@@ -87,17 +87,13 @@ func run(argDir string) (err error) {
 	log.Println("Generating...")
 	g.generateHead(dstPkg.name, srcType.dir)
 	if _, err = g.generate(srcType, dstType); err != nil {
-		return errors.Wrapf(err, "generate: %s", err)
+		return errors.Wrapf(err, "generate error")
 	}
 
-	var formatOnly bool
-	if g.rootDir == srcType.dir {
-		formatOnly = true
-	}
 	// Format the output.
-	srcCode, err := g.goimport(formatOnly)
+	srcCode, err := g.goimport()
 	if err != nil {
-		return errors.Wrapf(err, "goimport: %s", err)
+		return errors.Wrapf(err, "goimport error")
 	}
 
 	// Write to file.
@@ -105,7 +101,7 @@ func run(argDir string) (err error) {
 	outputName := filepath.Join(dstType.dir, strings.ToLower(baseName))
 	err = ioutil.WriteFile(outputName, srcCode, 0644)
 	if err != nil {
-		return errors.Wrapf(err, "Writing output: %s", err)
+		return errors.Wrapf(err, "Writing output error")
 	}
 	return nil
 }
@@ -140,7 +136,7 @@ func (g *Generator) parseFullTypeString(fullType string, pkg *Package) Type {
 
 func (g *Generator) parseType(t types.Type, pkg *Package) Type {
 	var typeName string
-	var isSlice, isPointer, isBasic bool
+	var isSlice, isPointer, isBasic, isNullType bool
 	if s, ok := t.(*types.Slice); ok {
 		isSlice = true
 		t = s.Elem()
@@ -152,7 +148,10 @@ func (g *Generator) parseType(t types.Type, pkg *Package) Type {
 	}
 
 	switch s := t.(type) {
-	case *types.Struct, *types.Named:
+	case *types.Named:
+		typeName = s.String()
+		isNullType = strings.Contains(s.String(), "null") && g.hasMethod(s, "Ptr")
+	case *types.Struct:
 		typeName = s.String()
 	case *types.Basic:
 		isBasic = true
@@ -162,9 +161,11 @@ func (g *Generator) parseType(t types.Type, pkg *Package) Type {
 	}
 
 	typ := g.parseFullTypeString(typeName, pkg)
+	typ.typ = t
 	typ.isSlice = isSlice
 	typ.isPointer = isPointer
 	typ.isBasic = isBasic
+	typ.isNullType = isNullType
 
 	return typ
 }
@@ -235,11 +236,13 @@ func (g *Generator) generateHead(pkgName, importPath string) {
 }
 
 type Type struct {
-	dir       string
-	name      string
-	isSlice   bool
-	isPointer bool
-	isBasic   bool
+	dir        string
+	name       string
+	typ        types.Type
+	isSlice    bool
+	isPointer  bool
+	isBasic    bool
+	isNullType bool
 }
 
 func (g *Generator) generate(srcType, dstType Type) (funcName string, err error) {
@@ -254,19 +257,15 @@ func (g *Generator) generate(srcType, dstType Type) (funcName string, err error)
 	dstPkg := g.parsePackageDir(dstType.dir)
 
 	conf := types.Config{
-		// Importer: importer.Default(),
 		Importer: importer.For("source", nil),
-		Error: func(err error) {
-			fmt.Printf("!!! %#v\n", err)
-		},
 	}
 
-	srcObj, err := g.lookup(conf, srcPkg, srcType)
+	srcObj, err := g.lookup(conf, srcPkg, srcType.name)
 	if err != nil {
 		return "", errors.Wrapf(err, "Lookup: %s.%s", srcPkg.name, srcType.name)
 	}
 
-	dstObj, err := g.lookup(conf, dstPkg, dstType)
+	dstObj, err := g.lookup(conf, dstPkg, dstType.name)
 	if err != nil {
 		return "", errors.Wrapf(err, "Lookup: %s.%s", dstPkg.name, dstType.name)
 	}
@@ -292,15 +291,15 @@ func (g *Generator) generate(srcType, dstType Type) (funcName string, err error)
 
 	return g.generateCode(src, dst), nil
 }
-func (g *Generator) lookup(conf types.Config, pkg *Package, typ Type) (types.Object, error) {
-	log.Printf("Lookup %s.%s\n", pkg.name, typ.name)
+func (g *Generator) lookup(conf types.Config, pkg *Package, name string) (types.Object, error) {
+	log.Printf("Lookup %s.%s\n", pkg.name, name)
 	p, err := conf.Check(pkg.name, pkg.fset, pkg.astFiles, nil)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrapf(err, "%s package includes the error", pkg.name)
 	}
-	obj := p.Scope().Lookup(typ.name)
+	obj := p.Scope().Lookup(name)
 	if obj == nil {
-		return nil, fmt.Errorf("Failed to lookup: %s", typ.name)
+		return nil, fmt.Errorf("Failed to lookup: %s", name)
 	}
 	return obj, nil
 }
@@ -378,26 +377,38 @@ func (g *Generator) generateCode(src, dst Object) (funcName string) {
 					nestedDstType := g.parseType(dstField.Type(), dst.pkg)
 
 					switch {
-					case nestedDstType.name == "string":
-						srcFieldCode = fmt.Sprintf(`fmt.Sprint(%s)`, srcFieldCode)
-						if nestedDstType.isPointer {
-							tmpSrcField := toLowerFirstChar(srcField.Name())
-							fmt.Fprintf(&variables, "	%s := %s\n", tmpSrcField, srcFieldCode)
-							srcFieldCode = "&" + tmpSrcField
-						}
 					case nestedDstType.isBasic:
-						converter, err := g.generateConverteCode(nestedSrcType, nestedDstType.name)
+						if nestedSrcType.isNullType {
+							srcFieldCode = fmt.Sprintf("%s.Ptr()", srcFieldCode)
+							if !nestedDstType.isPointer {
+								srcFieldCode = "*" + srcFieldCode
+							}
+							break
+						}
+						srcfieldCodeTemplate, err := g.generateConvertCode(nestedSrcType.typ, nestedDstType.name)
 						if err != nil {
 							log.Printf("skip field (%s) due to difference types", srcField.Name())
 							continue
 						}
-						srcFieldCode = fmt.Sprintf("s.%s.%s", srcField.Name(), converter)
+						srcFieldCode = fmt.Sprintf(srcfieldCodeTemplate, srcFieldCode)
 
 						if nestedDstType.isPointer {
 							tmpSrcField := toLowerFirstChar(srcField.Name())
 							fmt.Fprintf(&variables, "	%s := %s\n", tmpSrcField, srcFieldCode)
 							srcFieldCode = "&" + tmpSrcField
 						}
+					case nestedDstType.isNullType:
+						funcName := fmt.Sprintf("%sFrom", strings.Title(nestedSrcType.name))
+						if nestedSrcType.isPointer {
+							funcName = fmt.Sprintf("%sFromPtr", strings.Title(nestedSrcType.name))
+						}
+						pkg := g.parsePackageDir(nestedDstType.dir)
+						if !(nestedSrcType.isBasic && g.hasFunc(pkg, funcName)) {
+							log.Printf("skip %s(%s) and %s(%s)\n", srcField.Name(), srcField.Type().String(),
+								dstField.Name(), dstField.Type().String())
+							continue
+						}
+						srcFieldCode = fmt.Sprintf("%s.%s(%s)", pkg.name, funcName, srcFieldCode)
 					default:
 						nestedFuncName, err := g.generate(nestedSrcType, nestedDstType)
 						if err != nil {
@@ -469,40 +480,61 @@ func (g *Generator) generateSliceCode(src, dst Object) (funcName string) {
 	return funcName
 }
 
-func (g *Generator) generateConverteCode(typ Type, primitive string) (string, error) {
-	pkg := g.parsePackageDir(typ.dir)
-
-	conf := types.Config{
-		Importer: importer.For("source", nil),
-		Error: func(err error) {
-			fmt.Printf("!!! %#v\n", err)
-		},
+func (g *Generator) generateConvertCode(typ types.Type, primitive string) (string, error) {
+	if primitive == "string" {
+		return `fmt.Sprint(%s)`, nil
 	}
 
-	obj, err := g.lookup(conf, pkg, typ)
-	if err != nil {
-		return "", errors.Wrapf(err, "Lookup: %s.%s", pkg.name, typ.name)
-	}
-	s := obj.Type().Underlying().(*types.Struct)
-	for i := 0; i < s.NumFields(); i++ {
-		field := s.Field(i)
-		if field.Exported() && primitive == strings.ToLower(field.Name()) && primitive == field.Type().String() {
-			return field.Name(), nil
-		}
+	fieldName := strings.Title(primitive)
+	if g.hasField(typ, fieldName, primitive) {
+		return "%s." + fieldName, nil
 	}
 
 	return "", errors.New("not found")
-
 }
 
-func (g *Generator) goimport(formatOnly bool) ([]byte, error) {
+func (g *Generator) hasField(typ types.Type, fieldName string, typeName string) bool {
+	s, ok := typ.Underlying().(*types.Struct)
+	if !ok {
+		return false
+	}
+	for i := 0; i < s.NumFields(); i++ {
+		field := s.Field(i)
+		if field.Exported() && fieldName == field.Name() && typeName == field.Type().String() {
+			return true
+		}
+	}
+	return false
+}
+func (g *Generator) hasFunc(pkg *Package, funcName string) bool {
+	conf := types.Config{
+		Importer: importer.For("source", nil),
+	}
+
+	if _, err := g.lookup(conf, pkg, funcName); err != nil {
+		return false
+	}
+	return true
+}
+
+func (g *Generator) hasMethod(typ types.Type, methodName string) bool {
+	s, ok := typ.(*types.Named)
+	if !ok {
+		return false
+	}
+	for i := 0; i < s.NumMethods(); i++ {
+		if s.Method(i).Name() == methodName {
+			return true
+		}
+	}
+	return false
+}
+
+func (g *Generator) goimport() ([]byte, error) {
 	opts := &imports.Options{
 		Comments:  true,
 		TabIndent: true,
 		TabWidth:  8,
-	}
-	if formatOnly {
-		opts.FormatOnly = true
 	}
 	src, err := imports.Process("", g.buf.Bytes(), opts)
 	if err != nil {
